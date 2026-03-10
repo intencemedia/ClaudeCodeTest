@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SNIPER ARCADE</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+canvas { cursor: crosshair; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ── Setup ──
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 800, H = 600;
+const WORLD_W = 3200, WORLD_H = 600;
+canvas.width = W; canvas.height = H;
+
+// Offscreen buffer for pixelation
+const buf = document.createElement('canvas');
+buf.width = W / 2; buf.height = H / 2;
+const bctx = buf.getContext('2d');
+bctx.imageSmoothingEnabled = false;
+
+// ── State ──
+let cameraX = (WORLD_W - W) / 2, cameraY = 0;
+let pointerLocked = false;
+let score = 0;
+let gameStarted = false;
+let zoomed = false;
+let shooting = false;
+let shootCooldown = 0;
+const SHOOT_CD = 800;
+let recoilY = 0;
+let muzzleFlash = 0;
+let killFlash = 0;
+let ammo = 5;
+let reloading = false;
+let reloadTimer = 0;
+const RELOAD_TIME = 2000;
+let difficulty = 1;
+let difficultyTimer = 0;
+
+// ── Audio ──
+let audioCtx = null;
+function initAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playGunshot() {
+  initAudio();
+  const duration = 0.12;
+  const bufferSize = audioCtx.sampleRate * duration;
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) {
+    data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / bufferSize, 3);
+  }
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  const bandpass = audioCtx.createBiquadFilter();
+  bandpass.type = 'bandpass';
+  bandpass.frequency.value = 800;
+  bandpass.Q.value = 1;
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.4, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  source.connect(bandpass);
+  bandpass.connect(gain);
+  gain.connect(audioCtx.destination);
+  source.start();
+}
+function playHitBeep() {
+  initAudio();
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.value = 800;
+  gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.08);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.08);
+}
+
+// ── Terrain ──
+const terrainPoints = [];
+for (let x = 0; x <= WORLD_W; x += 8) {
+  const base = H * 0.65;
+  const noise = Math.sin(x * 0.005) * 30 + Math.sin(x * 0.013) * 15 + Math.sin(x * 0.031) * 8 + (Math.random() - 0.5) * 10;
+  terrainPoints.push({ x, y: base + noise });
+}
+
+// Background elements - cacti and rocks
+const bgElements = [];
+for (let i = 0; i < 40; i++) {
+  bgElements.push({
+    x: Math.random() * WORLD_W,
+    type: Math.random() < 0.5 ? 'cactus' : 'rock',
+    size: 3 + Math.random() * 5
+  });
+}
+
+function getTerrainY(wx) {
+  const idx = Math.floor(wx / 8);
+  if (idx < 0 || idx >= terrainPoints.length - 1) return H * 0.65;
+  const t = (wx / 8) - idx;
+  return terrainPoints[idx].y * (1 - t) + terrainPoints[Math.min(idx + 1, terrainPoints.length - 1)].y * t;
+}
+
+// ── Enemies ──
+const enemies = [];
+const MAX_ENEMIES = 8;
+
+function spawnEnemy() {
+  const x = Math.random() * WORLD_W;
+  const y = getTerrainY(x);
+  enemies.push({
+    x, y: y - 7,
+    dir: Math.random() < 0.5 ? -1 : 1,
+    speed: (0.3 + Math.random() * 0.4 * difficulty) / 4,
+    frame: 0,
+    frameTimer: 0,
+    alive: true,
+    h: 7 // height in pixels
+  });
+}
+
+// Initial spawn
+for (let i = 0; i < 5; i++) spawnEnemy();
+
+// ── Particles ──
+const particles = [];
+
+function spawnExplosion(wx, wy) {
+  const count = 15 + Math.floor(Math.random() * 10);
+  for (let i = 0; i < count; i++) {
+    const colors = ['#ff0000', '#ff4400', '#ff8800', '#ffcc00', '#ffff00', '#ff2200'];
+    particles.push({
+      x: wx + (Math.random() - 0.5) * 6,
+      y: wy + (Math.random() - 0.5) * 6,
+      vx: (Math.random() - 0.5) * 3,
+      vy: -Math.random() * 3 - 1,
+      life: 30 + Math.floor(Math.random() * 20),
+      maxLife: 50,
+      color: colors[Math.floor(Math.random() * colors.length)],
+      size: 1 + Math.random() * 2
+    });
+  }
+}
+
+// ── Input ──
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key.toLowerCase() === 'z') zoomed = !zoomed;
+  if (e.key.toLowerCase() === 'a' && gameStarted) tryShoot();
+});
+document.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+
+canvas.addEventListener('click', () => {
+  if (!pointerLocked) {
+    canvas.requestPointerLock();
+  }
+});
+
+canvas.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  if (gameStarted) zoomed = !zoomed;
+});
+
+document.addEventListener('pointerlockchange', () => {
+  pointerLocked = document.pointerLockElement === canvas;
+  if (pointerLocked) gameStarted = true;
+});
+
+document.addEventListener('mousemove', e => {
+  if (!pointerLocked) return;
+  const sensitivity = zoomed ? 0.15 : 0.5;
+  cameraX += e.movementX * sensitivity;
+  cameraY += e.movementY * sensitivity * 0.3;
+  cameraX = Math.max(0, Math.min(WORLD_W - W, cameraX));
+  cameraY = Math.max(-100, Math.min(100, cameraY));
+});
+
+function tryShoot() {
+  if (shootCooldown > 0 || reloading) return;
+  if (ammo <= 0) {
+    reloading = true;
+    reloadTimer = RELOAD_TIME;
+    return;
+  }
+  ammo--;
+  shootCooldown = SHOOT_CD;
+  recoilY = 20;
+  muzzleFlash = 8;
+  playGunshot();
+
+  // Hit detection - crosshair center in world space
+  const crossWX = cameraX + W / 2;
+  const crossWY = cameraY + H / 2;
+
+  const hitRadius = zoomed ? 6 : 10;
+
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    if (!e.alive) continue;
+    const dx = crossWX - e.x;
+    const dy = crossWY - e.y;
+    if (Math.abs(dx) < hitRadius && Math.abs(dy) < hitRadius + 4) {
+      e.alive = false;
+      score += 100;
+      killFlash = 60;
+      spawnExplosion(e.x, e.y);
+      playHitBeep();
+      break;
+    }
+  }
+
+  if (ammo <= 0) {
+    reloading = true;
+    reloadTimer = RELOAD_TIME;
+  }
+}
+
+// ── Update ──
+let lastTime = 0;
+function update(dt) {
+  // Cooldowns
+  if (shootCooldown > 0) shootCooldown -= dt;
+  if (recoilY > 0) recoilY *= 0.88;
+  if (recoilY < 0.5) recoilY = 0;
+  if (muzzleFlash > 0) muzzleFlash--;
+  if (killFlash > 0) killFlash--;
+
+  // Reload
+  if (reloading) {
+    reloadTimer -= dt;
+    if (reloadTimer <= 0) {
+      reloading = false;
+      ammo = 5;
+    }
+  }
+
+  // Difficulty ramp
+  difficultyTimer += dt;
+  if (difficultyTimer > 15000) {
+    difficultyTimer = 0;
+    difficulty = Math.min(difficulty + 0.2, 3);
+  }
+
+  // Enemies
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    if (!e.alive) {
+      enemies.splice(i, 1);
+      continue;
+    }
+    e.x += e.dir * e.speed;
+    e.y = getTerrainY(e.x) - 7;
+    e.frameTimer++;
+    if (e.frameTimer > 15) { e.frame = (e.frame + 1) % 2; e.frameTimer = 0; }
+    if (e.x < 20 || e.x > WORLD_W - 20) e.dir *= -1;
+  }
+
+  // Spawn enemies
+  while (enemies.length < MAX_ENEMIES + Math.floor(difficulty)) spawnEnemy();
+
+  // Particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.08;
+    p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+// ── Render ──
+function render(c) {
+  c.imageSmoothingEnabled = false;
+
+  if (zoomed) {
+    // Scope view
+    c.fillStyle = '#000';
+    c.fillRect(0, 0, W, H);
+
+    c.save();
+    // Circular clip
+    c.beginPath();
+    c.arc(W / 2, H / 2, 250, 0, Math.PI * 2);
+    c.clip();
+
+    // 5x zoom centered on crosshair
+    const zoomCX = W / 2;
+    const zoomCY = H / 2;
+    c.translate(zoomCX, zoomCY);
+    c.scale(5, 5);
+    c.translate(-zoomCX, -zoomCY);
+
+    drawScene(c);
+
+    c.restore();
+
+    // Scope ring
+    c.save();
+    c.beginPath();
+    c.arc(W / 2, H / 2, 250, 0, Math.PI * 2);
+    c.lineWidth = 30;
+    c.strokeStyle = '#111';
+    c.stroke();
+    c.lineWidth = 4;
+    c.strokeStyle = '#333';
+    c.stroke();
+    c.restore();
+
+    // Crosshair
+    drawScopeCrosshair(c);
+  } else {
+    drawScene(c);
+    // Simple crosshair
+    c.strokeStyle = 'rgba(0,255,0,0.6)';
+    c.lineWidth = 1;
+    c.beginPath();
+    c.moveTo(W / 2 - 15, H / 2); c.lineTo(W / 2 - 5, H / 2);
+    c.moveTo(W / 2 + 5, H / 2); c.lineTo(W / 2 + 15, H / 2);
+    c.moveTo(W / 2, H / 2 - 15); c.lineTo(W / 2, H / 2 - 5);
+    c.moveTo(W / 2, H / 2 + 5); c.lineTo(W / 2, H / 2 + 15);
+    c.stroke();
+  }
+
+  // Rifle overlay (screen space)
+  drawRifle(c);
+
+  // Muzzle flash
+  if (muzzleFlash > 0) {
+    const alpha = muzzleFlash / 8;
+    c.fillStyle = `rgba(255,255,100,${alpha})`;
+    c.fillRect(W - 260, H - 320 - recoilY, 12, 20);
+    c.fillStyle = `rgba(255,200,50,${alpha * 0.5})`;
+    c.fillRect(W - 265, H - 330 - recoilY, 22, 10);
+  }
+
+  // HUD
+  drawHUD(c);
+
+  // Scanlines
+  c.fillStyle = 'rgba(0,0,0,0.08)';
+  for (let y = 0; y < H; y += 2) {
+    c.fillRect(0, y, W, 1);
+  }
+
+  // Start screen
+  if (!gameStarted) {
+    c.fillStyle = 'rgba(0,0,0,0.7)';
+    c.fillRect(0, 0, W, H);
+    c.fillStyle = '#00ff00';
+    c.font = '32px monospace';
+    c.textAlign = 'center';
+    c.fillText('SNIPER ARCADE', W / 2, H / 2 - 60);
+    c.font = '16px monospace';
+    c.fillStyle = '#00cc00';
+    c.fillText('Click to Play', W / 2, H / 2);
+    c.font = '12px monospace';
+    c.fillStyle = '#008800';
+    c.fillText('Mouse: Aim  |  A: Shoot  |  Z/Right-Click: Scope', W / 2, H / 2 + 40);
+    c.fillText('R: Reload', W / 2, H / 2 + 60);
+    c.textAlign = 'left';
+  }
+}
+
+function drawScene(c) {
+  // Sky gradient
+  const grad = c.createLinearGradient(0, 0, 0, H * 0.65);
+  grad.addColorStop(0, '#1a0a2e');
+  grad.addColorStop(0.3, '#4a2060');
+  grad.addColorStop(0.6, '#cc5522');
+  grad.addColorStop(1, '#ffaa44');
+  c.fillStyle = grad;
+  c.fillRect(0, 0, W, H);
+
+  // Sun
+  const sunX = 600 - cameraX * 0.1;
+  const sunY = 120 + cameraY * 0.2;
+  c.fillStyle = '#ffdd44';
+  c.beginPath();
+  c.arc(sunX, sunY, 40, 0, Math.PI * 2);
+  c.fill();
+  c.fillStyle = 'rgba(255,220,100,0.3)';
+  c.beginPath();
+  c.arc(sunX, sunY, 70, 0, Math.PI * 2);
+  c.fill();
+
+  // Distant mountains
+  c.fillStyle = '#442244';
+  c.beginPath();
+  c.moveTo(0, H * 0.55);
+  for (let x = 0; x <= W; x += 4) {
+    const wx = x + cameraX * 0.3;
+    const my = H * 0.55 - Math.sin(wx * 0.003) * 40 - Math.sin(wx * 0.008) * 20 - Math.sin(wx * 0.002) * 30;
+    c.lineTo(x, my + cameraY * 0.3);
+  }
+  c.lineTo(W, H);
+  c.lineTo(0, H);
+  c.fill();
+
+  // Mid-ground hills
+  c.fillStyle = '#553322';
+  c.beginPath();
+  c.moveTo(0, H * 0.62);
+  for (let x = 0; x <= W; x += 4) {
+    const wx = x + cameraX * 0.6;
+    const my = H * 0.62 - Math.sin(wx * 0.005) * 20 - Math.sin(wx * 0.012) * 10;
+    c.lineTo(x, my + cameraY * 0.5);
+  }
+  c.lineTo(W, H);
+  c.lineTo(0, H);
+  c.fill();
+
+  // Ground terrain
+  c.fillStyle = '#8B7355';
+  c.beginPath();
+  c.moveTo(0, H);
+  for (let i = 0; i < terrainPoints.length; i++) {
+    const sx = terrainPoints[i].x - cameraX;
+    const sy = terrainPoints[i].y + cameraY;
+    if (i === 0) c.moveTo(sx, sy);
+    else c.lineTo(sx, sy);
+  }
+  c.lineTo(WORLD_W - cameraX, H);
+  c.lineTo(-cameraX, H);
+  c.closePath();
+  c.fill();
+
+  // Ground detail - darker patches
+  c.fillStyle = '#7a6545';
+  for (let x = 0; x <= W; x += 16) {
+    const wx = x + cameraX;
+    const ty = getTerrainY(wx) + cameraY;
+    if (Math.sin(wx * 0.1) > 0.3) {
+      c.fillRect(x, ty, 8, 4);
+    }
+  }
+
+  // Background elements (cacti, rocks)
+  bgElements.forEach(el => {
+    const sx = el.x - cameraX;
+    const sy = getTerrainY(el.x) + cameraY;
+    if (sx < -20 || sx > W + 20) return;
+    if (el.type === 'cactus') {
+      c.fillStyle = '#2d5a1e';
+      c.fillRect(sx - 1, sy - el.size * 2, 3, el.size * 2);
+      c.fillRect(sx - 4, sy - el.size * 1.5, 3, el.size * 0.5);
+      c.fillRect(sx + 2, sy - el.size, 3, el.size * 0.5);
+    } else {
+      c.fillStyle = '#666';
+      c.fillRect(sx - el.size / 2, sy - el.size * 0.6, el.size, el.size * 0.6);
+    }
+  });
+
+  // Enemies
+  enemies.forEach(e => {
+    if (!e.alive) return;
+    const sx = e.x - cameraX;
+    const sy = e.y + cameraY;
+    if (sx < -20 || sx > W + 20) return;
+
+    // Body (olive drab)
+    c.fillStyle = '#556B2F';
+    c.fillRect(sx - 2, sy - 3, 4, 5);
+
+    // Head
+    c.fillStyle = '#DEB887';
+    c.fillRect(sx - 1, sy - 5, 3, 2);
+
+    // Helmet
+    c.fillStyle = '#333';
+    c.fillRect(sx - 2, sy - 6, 4, 2);
+
+    // Legs
+    c.fillStyle = '#444';
+    if (e.frame === 0) {
+      c.fillRect(sx - 2, sy + 2, 2, 3);
+      c.fillRect(sx + 1, sy + 2, 2, 3);
+    } else {
+      c.fillRect(sx - 1, sy + 2, 2, 3);
+      c.fillRect(sx, sy + 2, 2, 3);
+    }
+  });
+
+  // Particles
+  particles.forEach(p => {
+    const sx = p.x - cameraX;
+    const sy = p.y + cameraY;
+    if (sx < -5 || sx > W + 5) return;
+    const alpha = p.life / p.maxLife;
+    c.globalAlpha = alpha;
+    c.fillStyle = p.color;
+    c.fillRect(sx, sy, p.size, p.size);
+  });
+  c.globalAlpha = 1;
+}
+
+function drawScopeCrosshair(c) {
+  const cx = W / 2, cy = H / 2;
+
+  // Main crosshair lines
+  c.strokeStyle = '#00ff00';
+  c.lineWidth = 1.5;
+
+  // Horizontal
+  c.beginPath();
+  c.moveTo(cx - 240, cy); c.lineTo(cx - 20, cy);
+  c.moveTo(cx + 20, cy); c.lineTo(cx + 240, cy);
+  c.stroke();
+
+  // Vertical
+  c.beginPath();
+  c.moveTo(cx, cy - 240); c.lineTo(cx, cy - 20);
+  c.moveTo(cx, cy + 20); c.lineTo(cx, cy + 240);
+  c.stroke();
+
+  // Mil-dots
+  c.fillStyle = '#00ff00';
+  for (let i = 1; i <= 5; i++) {
+    const offset = i * 40;
+    c.fillRect(cx + offset - 1.5, cy - 1.5, 3, 3);
+    c.fillRect(cx - offset - 1.5, cy - 1.5, 3, 3);
+    c.fillRect(cx - 1.5, cy + offset - 1.5, 3, 3);
+    c.fillRect(cx - 1.5, cy - offset - 1.5, 3, 3);
+  }
+
+  // Center dot
+  c.fillStyle = '#ff0000';
+  c.fillRect(cx - 1, cy - 1, 3, 3);
+
+  // Range marks
+  c.font = '10px monospace';
+  c.fillStyle = '#00ff00';
+  c.textAlign = 'left';
+  c.fillText('400m', cx + 210, cy - 5);
+}
+
+function drawRifle(c) {
+  const ry = recoilY;
+
+  c.save();
+  c.translate(W - 150, H + 50 + ry);
+  c.rotate(-0.25);
+
+  // Stock
+  c.fillStyle = '#3a2a1a';
+  c.fillRect(-30, -20, 120, 22);
+  c.fillRect(80, -25, 40, 30);
+
+  // Barrel
+  c.fillStyle = '#2a2a2a';
+  c.fillRect(-180, -12, 200, 12);
+
+  // Barrel highlight
+  c.fillStyle = '#3a3a3a';
+  c.fillRect(-180, -12, 200, 3);
+
+  // Scope tube
+  c.fillStyle = '#222';
+  c.fillRect(-80, -30, 80, 10);
+  // Scope lens
+  c.fillStyle = '#114488';
+  c.beginPath();
+  c.arc(-80, -25, 6, 0, Math.PI * 2);
+  c.fill();
+  c.fillStyle = '#226699';
+  c.beginPath();
+  c.arc(-78, -27, 2, 0, Math.PI * 2);
+  c.fill();
+
+  // Magazine
+  c.fillStyle = '#333';
+  c.fillRect(10, 2, 20, 18);
+
+  // Trigger guard
+  c.strokeStyle = '#333';
+  c.lineWidth = 2;
+  c.beginPath();
+  c.arc(30, 8, 10, 0, Math.PI);
+  c.stroke();
+
+  // Bolt handle
+  c.fillStyle = '#444';
+  c.fillRect(50, -20, 6, 8);
+
+  // Hand (rear grip)
+  c.fillStyle = '#DEB887';
+  c.fillRect(40, -5, 20, 20);
+  c.fillStyle = '#C8A878';
+  // Fingers
+  c.fillRect(38, 5, 5, 14);
+  c.fillRect(44, 7, 5, 14);
+  c.fillRect(50, 5, 5, 14);
+
+  // Front hand
+  c.fillStyle = '#DEB887';
+  c.fillRect(-40, 0, 22, 14);
+  c.fillStyle = '#C8A878';
+  c.fillRect(-42, 4, 5, 12);
+  c.fillRect(-36, 6, 5, 12);
+
+  c.restore();
+}
+
+function drawHUD(c) {
+  // Score
+  c.font = '20px monospace';
+  c.fillStyle = '#00ff00';
+  c.textAlign = 'left';
+  c.fillText(`SCORE: ${score}`, 20, 35);
+
+  // Ammo
+  c.font = '16px monospace';
+  c.fillStyle = reloading ? '#ff4444' : '#00ff00';
+  if (reloading) {
+    const dots = '.'.repeat(Math.floor((Date.now() / 300) % 4));
+    c.fillText(`RELOADING${dots}`, 20, H - 30);
+  } else {
+    c.fillText(`AMMO: ${'|'.repeat(ammo)}${'·'.repeat(5 - ammo)}`, 20, H - 30);
+  }
+
+  // Kill flash
+  if (killFlash > 0) {
+    const alpha = killFlash / 60;
+    c.font = '36px monospace';
+    c.fillStyle = `rgba(255,50,50,${alpha})`;
+    c.textAlign = 'center';
+    c.fillText('KILL!', W / 2, H / 2 - 80);
+    c.textAlign = 'left';
+  }
+
+  // Zoom indicator
+  if (zoomed) {
+    c.font = '12px monospace';
+    c.fillStyle = '#00ff00';
+    c.fillText('5x ZOOM', W - 100, 30);
+  }
+
+  // Difficulty / wave indicator
+  c.font = '12px monospace';
+  c.fillStyle = '#008800';
+  c.textAlign = 'right';
+  c.fillText(`THREAT: ${Math.floor(difficulty * 10) / 10}x`, W - 20, H - 30);
+  c.textAlign = 'left';
+}
+
+// ── Reload key ──
+document.addEventListener('keydown', e => {
+  if (e.key.toLowerCase() === 'r' && !reloading && ammo < 5 && gameStarted) {
+    reloading = true;
+    reloadTimer = RELOAD_TIME;
+  }
+});
+
+// ── Game Loop ──
+function gameLoop(timestamp) {
+  const dt = lastTime ? Math.min(timestamp - lastTime, 50) : 16;
+  lastTime = timestamp;
+
+  if (gameStarted) update(dt);
+
+  ctx.clearRect(0, 0, W, H);
+  render(ctx);
+
+  requestAnimationFrame(gameLoop);
+}
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
